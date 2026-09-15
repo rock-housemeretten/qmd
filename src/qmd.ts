@@ -57,6 +57,7 @@ import {
   hybridQuery,
   vectorSearchQuery,
   getChunkEnd,
+  rankPassages,
   addLineNumbers,
   type ExpandedQuery,
   DEFAULT_EMBED_MODEL,
@@ -1970,6 +1971,44 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
+/**
+ * Rock #266 Tier 1 — `qmd passages <file> <query>`.
+ *
+ * Ranks ONE already-chosen document's stored chunk vectors against a query. vsearch picks the
+ * right document and the wrong paragraph; this picks the paragraph.
+ *
+ * INFRASTRUCTURE FAILURES EXIT NON-ZERO. A document that was never embedded is not a document
+ * with no matching passage, and exiting 0 with `[]` would let a caller report "nothing here" for
+ * "never indexed". The gateway maps a non-zero exit to `unavailable`.
+ */
+async function passagesSearch(fileRef: string, query: string, opts: OutputOptions & { limit?: number }): Promise<void> {
+  const store = getStore();
+  await withLLMSession(async () => {
+    const res = await rankPassages(store.db, fileRef, query, { limit: opts.limit ?? 3 });
+    closeDb();
+    if (!res.ok) {
+      const why: Record<string, string> = {
+        not_found: `no active document matches ${fileRef}`,
+        not_embedded: `${fileRef} has no stored chunk vectors — run \`qmd embed\``,
+        no_vectors_table: "this index has no vector table — run `qmd embed`",
+        embed_failed: "could not embed the query (is the embedder reachable?)",
+      };
+      console.error(`qmd passages: ${why[res.error] ?? res.error}`);
+      process.exit(1);
+    }
+    if (opts.format === "json") {
+      console.log(JSON.stringify(res.passages, null, 2));
+      return;
+    }
+    for (const p of res.passages) {
+      const count = p.endLine - p.startLine + 1;
+      console.log(`@@ -${p.startLine},${count} @@ (score ${Math.round(p.score * 100) / 100}, chunk ${p.seq})`);
+      console.log(p.text.trimEnd());
+      console.log("");
+    }
+  }, { maxDuration: 5 * 60 * 1000, name: 'passages' });
+}
+
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const store = getStore();
 
@@ -2134,6 +2173,7 @@ function showHelp(): void {
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd search <query>            - Full-text search (BM25)");
   console.log("  qmd vsearch <query>           - Vector similarity search");
+  console.log("  qmd passages <file> <query>   - Rank one document's chunks against a query");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
   console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
@@ -2389,6 +2429,19 @@ if (import.meta.main) {
       }
       await vectorSearch(cli.query, cli.opts);
       break;
+
+    case "passages": {
+      // Rock #266 Tier 1. Two positionals: the document, then the query (rest of argv joined).
+      const fileRef = cli.args[0];
+      const pq = cli.args.slice(1).join(" ").trim();
+      if (!fileRef || !pq) {
+        console.error("Usage: qmd passages <file|#docid> <query> [-n <K>] [--json]");
+        console.error("  Ranks one document's indexed chunks against the query (default K=3).");
+        process.exit(1);
+      }
+      await passagesSearch(fileRef, pq, { ...cli.opts, limit: cli.opts.limit || 3 });
+      break;
+    }
 
     case "query":
       if (!cli.query) {

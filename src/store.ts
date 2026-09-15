@@ -1944,6 +1944,116 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
+// =============================================================================
+// Rock #266 Tier 1 — qmd passages
+// =============================================================================
+
+export interface Passage {
+  seq: number;
+  pos: number;
+  startLine: number;   // 1-indexed, from the document body
+  endLine: number;     // 1-indexed, inclusive
+  score: number;       // cosine similarity, 1 = identical
+  text: string;
+}
+
+export type RankPassagesResult =
+  | { ok: true; passages: Passage[] }
+  | { ok: false; error: 'not_found' | 'not_embedded' | 'no_vectors_table' | 'embed_failed' };
+
+/**
+ * Rank ONE document's already-stored chunk embeddings against a query.
+ *
+ * No new model and no new service: the query embed uses the resident embedder exactly as
+ * searchVec does, and the chunk vectors are read straight out of vectors_vec by hash_seq. The
+ * point is `vsearch` picks the right DOCUMENT and the wrong paragraph — this ranks the paragraphs
+ * inside a document that has already been chosen.
+ *
+ * Failures are TYPED and never an empty list. An unembedded document and a document with no
+ * matching passage are different facts, and a caller that cannot tell them apart will report
+ * "nothing here" for what is really "never indexed".
+ */
+export async function rankPassages(
+  db: Database,
+  fileOrDocid: string,
+  query: string,
+  opts?: { limit?: number; model?: string; session?: ILLMSession },
+): Promise<RankPassagesResult> {
+  const limit = Math.max(1, opts?.limit ?? 3);
+
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  if (!tableExists) return { ok: false, error: 'no_vectors_table' };
+
+  // Accept the three shapes a caller plausibly holds: a qmd:// uri, a bare collection/path, or
+  // a #docid. getDocid is a hash prefix, so the docid branch matches on that prefix.
+  const ref = fileOrDocid.trim();
+  const bare = ref.startsWith('qmd://') ? ref.slice('qmd://'.length) : ref;
+  let doc: { hash: string; body: string } | undefined;
+  if (bare.startsWith('#')) {
+    const want = bare.slice(1).toLowerCase();
+    doc = db.prepare(`
+      SELECT d.hash AS hash, content.doc AS body
+      FROM documents d JOIN content ON content.hash = d.hash
+      WHERE d.active = 1 AND substr(d.hash, 1, ?) = ?
+      LIMIT 1
+    `).get(want.length, want) as { hash: string; body: string } | undefined;
+  } else {
+    doc = db.prepare(`
+      SELECT d.hash AS hash, content.doc AS body
+      FROM documents d JOIN content ON content.hash = d.hash
+      WHERE d.active = 1 AND d.collection || '/' || d.path = ?
+      LIMIT 1
+    `).get(bare) as { hash: string; body: string } | undefined;
+  }
+  if (!doc) return { ok: false, error: 'not_found' };
+
+  const chunks = db.prepare(`SELECT seq, pos FROM content_vectors WHERE hash = ? ORDER BY seq`)
+    .all(doc.hash) as { seq: number; pos: number }[];
+  if (chunks.length === 0) return { ok: false, error: 'not_embedded' };
+
+  const embedding = await getEmbedding(query, opts?.model ?? DEFAULT_EMBED_MODEL, true, opts?.session);
+  if (!embedding) return { ok: false, error: 'embed_failed' };
+
+  const rows = db.prepare(`SELECT hash_seq, embedding FROM vectors_vec WHERE hash_seq IN (${chunks.map(() => '?').join(',')})`)
+    .all(...chunks.map(c => `${doc!.hash}_${c.seq}`)) as { hash_seq: string; embedding: unknown }[];
+  if (rows.length === 0) return { ok: false, error: 'not_embedded' };
+
+  const q = Float32Array.from(embedding);
+  const qNorm = Math.sqrt(q.reduce((a, v) => a + v * v, 0));
+  const bySeq = new Map(chunks.map(c => [c.seq, c.pos]));
+  // Line numbers are computed from the DOCUMENT body, not the passage, so a caller can cite them.
+  const lineAt = (offset: number) => doc!.body.slice(0, offset).split('\n').length; // 1-indexed
+
+  const scored: Passage[] = [];
+  for (const r of rows) {
+    const seq = Number(r.hash_seq.slice(r.hash_seq.lastIndexOf('_') + 1));
+    const pos = bySeq.get(seq);
+    if (pos === undefined) continue;
+    // sqlite-vec hands back the raw float32 BYTES (a Uint8Array/Buffer). `new Float32Array(buf)`
+    // on that reads each BYTE as an element — 3072 wrong values instead of 768 right ones — and
+    // the length check below then silently drops every chunk, which surfaces as `not_embedded`.
+    // A probe caught exactly that: the boundary test was passing with all its assertions skipped.
+    const raw = r.embedding as unknown;
+    let v: Float32Array;
+    if (raw instanceof Float32Array) v = raw;
+    else if (ArrayBuffer.isView(raw)) v = new Float32Array(raw.buffer, raw.byteOffset, Math.floor(raw.byteLength / 4));
+    else if (raw instanceof ArrayBuffer) v = new Float32Array(raw);
+    else continue;
+    if (v.length !== q.length) continue;
+    let dot = 0, vNorm = 0;
+    for (let i = 0; i < v.length; i++) { dot += q[i]! * v[i]!; vNorm += v[i]! * v[i]!; }
+    const score = qNorm && vNorm ? dot / (qNorm * Math.sqrt(vNorm)) : 0;
+    const nextPos = bySeq.get(seq + 1) ?? doc.body.length;
+    const text = doc.body.slice(pos, nextPos);
+    const startLine = lineAt(pos);
+    scored.push({ seq, pos, startLine, endLine: startLine + text.split('\n').length - 1, score, text });
+  }
+  if (scored.length === 0) return { ok: false, error: 'not_embedded' };
+
+  scored.sort((a, b) => b.score - a.score);
+  return { ok: true, passages: scored.slice(0, limit) };
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
