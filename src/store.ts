@@ -850,6 +850,8 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  chunkSeq?: number;          // Rock #266: that chunk's sequence, so the next chunk's pos (= this
+                              // chunk's END) can be looked up to bound the snippet window.
 };
 
 /**
@@ -1512,6 +1514,24 @@ export function getContextForPath(db: Database, collectionName: string, path: st
  * Get context for a file path (virtual or filesystem).
  * Resolves the collection and relative path using the YAML collections config.
  */
+/**
+ * Rock #266 Tier 0 — the END of a chunk, i.e. the next chunk's `pos` for the same document.
+ * Returns undefined when this is the last chunk, in which case the caller bounds at body length.
+ * Separate from searchVec's hot path on purpose: it is one indexed lookup, run only for the
+ * handful of results a CLI actually renders.
+ */
+export function getChunkEnd(db: Database, filepath: string, chunkSeq: number): number | undefined {
+  // Same join searchVec uses: documents(active=1) is what maps a qmd:// path to a content hash.
+  const row = db.prepare(`
+    SELECT cv.pos AS pos
+    FROM content_vectors cv
+    JOIN documents d ON d.hash = cv.hash AND d.active = 1
+    WHERE 'qmd://' || d.collection || '/' || d.path = ? AND cv.seq = ?
+    LIMIT 1
+  `).get(filepath, chunkSeq + 1) as { pos: number } | undefined;
+  return row?.pos;
+}
+
 export function getContextForFile(db: Database, filepath: string): string | null {
   // Handle undefined or null filepath
   if (!filepath) return null;
@@ -2006,6 +2026,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
+        // Rock #266: derived from hash_seq (`<hash>_<seq>`) rather than widening the SELECT —
+        // the value is already in the row key, so this adds no query surface.
+        chunkSeq: Number(row.hash_seq.slice(row.hash_seq.lastIndexOf('_') + 1)),
       };
     });
 }
@@ -2540,14 +2563,37 @@ export type SnippetResult = {
   snippetLines: number;   // Number of lines in snippet
 };
 
-export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number): SnippetResult {
+/** Rock #266 Tier 0 — escape a query term before it becomes a \b regex. */
+function escapeRe(t: string): string {
+  return t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Rock patch (#266, 2026-09-15) — three defects, all of which made the snippet land on the
+ * document HEAD rather than on the matched chunk:
+ *
+ *   1. `chunkPos && chunkPos > 0` treated chunk 0 as "no hint", so a hit in the first chunk
+ *      searched the whole document. Now any defined, in-range `chunkPos` is a hint.
+ *   2. The window was [chunkPos-100, chunkPos+maxLen+100] — roughly 700 chars of a ~2,400-char
+ *      chunk, so an answer late in the chunk was outside the window the scorer could see.
+ *      It is now the WHOLE chunk, bounded by `chunkEnd` (the next chunk's pos, or body length).
+ *   3. The line scorer used `includes` over every whitespace token, so `a`, `is` and `for`
+ *      scored on nearly every line and the title-restating head line won every query. It is now
+ *      a whole-word match over terms of length >= 3.
+ *
+ * The full-document fallback is kept: if the chunk window yields nothing, we still show something.
+ */
+export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkEnd?: number): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
   let lineOffset = 0;
 
-  if (chunkPos && chunkPos > 0) {
-    const contextStart = Math.max(0, chunkPos - 100);
-    const contextEnd = Math.min(body.length, chunkPos + maxLen + 100);
+  // Defect 1: `!== undefined`, not truthiness — chunk 0 is a real chunk at pos 0.
+  const hasHint = chunkPos !== undefined && chunkPos >= 0 && chunkPos < body.length;
+  if (hasHint) {
+    // Defect 2: the window IS the chunk.
+    const contextStart = chunkPos!;
+    const contextEnd = Math.min(body.length, chunkEnd !== undefined && chunkEnd > contextStart ? chunkEnd : body.length);
     searchBody = body.slice(contextStart, contextEnd);
     if (contextStart > 0) {
       lineOffset = body.slice(0, contextStart).split('\n').length - 1;
@@ -2555,14 +2601,17 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
   }
 
   const lines = searchBody.split('\n');
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  // Defect 3: whole-word, and only terms with signal. Split on non-word so punctuation in the
+  // question ("what's", "tree?") does not weld itself to a term and stop matching.
+  const queryTerms = query.toLowerCase().split(/\W+/).filter(t => t.length >= 3);
+  const termRes = queryTerms.map(t => new RegExp(`\\b${escapeRe(t)}\\b`));
   let bestLine = 0, bestScore = -1;
 
   for (let i = 0; i < lines.length; i++) {
     const lineLower = (lines[i] ?? "").toLowerCase();
     let score = 0;
-    for (const term of queryTerms) {
-      if (lineLower.includes(term)) score++;
+    for (const re of termRes) {
+      if (re.test(lineLower)) score++;
     }
     if (score > bestScore) {
       bestScore = score;
@@ -2577,8 +2626,8 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
 
   // If we focused on a chunk window and it produced an empty/whitespace-only snippet,
   // fall back to a full-document snippet so we always show something useful.
-  if (chunkPos && chunkPos > 0 && snippetText.trim().length === 0) {
-    return extractSnippet(body, query, maxLen, undefined);
+  if (hasHint && snippetText.trim().length === 0) {
+    return extractSnippet(body, query, maxLen, undefined, undefined);
   }
 
   if (snippetText.length > maxLen) snippetText = snippetText.substring(0, maxLen - 3) + "...";
@@ -2855,6 +2904,12 @@ export interface VectorSearchResult {
   score: number;
   context: string | null;
   docid: string;
+  /** Rock #266 Tier 0 — byte offset and sequence of the best-scoring CHUNK for this file.
+   *  searchVec already has these on its rows; they were dropped when merging per-file, which is
+   *  why the vsearch CLI had no hint to give extractSnippet. Optional: a merge path that cannot
+   *  attribute a chunk leaves them undefined and the old whole-document behaviour applies. */
+  chunkPos?: number;
+  chunkSeq?: number;
 }
 
 /**
@@ -2901,6 +2956,12 @@ export async function vectorSearchQuery(
           score: r.score,
           context: store.getContextForFile(r.filepath),
           docid: r.docid,
+          // Rock #266 Tier 0 — THE FIX. searchVec knew which chunk matched; this merge dropped
+          // it, so the vsearch CLI had nothing to hand extractSnippet and scored the whole
+          // document. Carried per-file for the highest-scoring chunk (this branch only runs
+          // when r.score beats what we had, so the kept chunk is the best one seen).
+          chunkPos: r.chunkPos,
+          chunkSeq: r.chunkSeq,
         });
       }
     }

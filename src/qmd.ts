@@ -56,6 +56,7 @@ import {
   handelize,
   hybridQuery,
   vectorSearchQuery,
+  getChunkEnd,
   addLineNumbers,
   type ExpandedQuery,
   DEFAULT_EMBED_MODEL,
@@ -1735,7 +1736,7 @@ function shortPath(dirpath: string): string {
   return dirpath;
 }
 
-function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
+function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; chunkSeq?: number; chunkEnd?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
@@ -1751,7 +1752,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     const output = filtered.map(row => {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, row.chunkEnd).snippet : undefined;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
@@ -1764,6 +1765,11 @@ function outputResults(results: { file: string; displayPath: string; title: stri
         ...(row.context && { context: row.context }),
         ...(body && { body }),
         ...(snippet && { snippet }),
+        // Rock #266 Tier 0 — ADDITIVE. The `@@ -L,n @@` header inside `snippet` is unchanged, so
+        // the gateway's parseVsearch keeps working; these let a consumer tell WHICH chunk the
+        // snippet came from, which is what the gateway's refinement step needs to detect no_gain.
+        ...(row.chunkPos !== undefined && { chunkPos: row.chunkPos }),
+        ...(row.chunkSeq !== undefined && { chunkSeq: row.chunkSeq }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -1778,7 +1784,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkEnd);
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
@@ -1819,7 +1825,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       if (!row) continue;
       const heading = row.title || row.displayPath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, row.chunkEnd).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -1832,7 +1838,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
       const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos, row.chunkEnd).snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content);
       }
@@ -1842,7 +1848,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     // CSV format
     console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos, row.chunkEnd);
       let content = opts.full ? row.body : snippet;
       if (opts.lineNumbers) {
         content = addLineNumbers(content, line);
@@ -1937,14 +1943,10 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       },
     });
 
-    closeDb();
-
-    if (results.length === 0) {
-      console.log("No results found.");
-      return;
-    }
-
-    outputResults(results.map(r => ({
+    // Rock #266 Tier 0 — resolve each hit's chunk END before the DB closes. vsearch was the one
+    // path that dropped the matched chunk entirely (querySearch below already passes bestChunkPos),
+    // so extractSnippet scored the whole document and the title-restating head line won every time.
+    const withChunks = results.map(r => ({
       file: r.file,
       displayPath: r.displayPath,
       title: r.title,
@@ -1952,7 +1954,19 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       score: r.score,
       context: r.context,
       docid: r.docid,
-    })), query, { ...opts, limit: results.length });
+      chunkPos: r.chunkPos,
+      chunkSeq: r.chunkSeq,
+      chunkEnd: r.chunkSeq !== undefined ? getChunkEnd(store.db, r.file, r.chunkSeq) : undefined,
+    }));
+
+    closeDb();
+
+    if (results.length === 0) {
+      console.log("No results found.");
+      return;
+    }
+
+    outputResults(withChunks, query, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
