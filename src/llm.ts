@@ -343,6 +343,22 @@ export type LlamaCppConfig = {
    * memory reclaim.
    */
   disposeModelsOnInactivity?: boolean;
+  /**
+   * Context size for the generation (query-expansion) model (default: 2048).
+   *
+   * node-llama-cpp defaults `contextSize` to "auto", which sizes the KV cache to fill available
+   * (unified) memory. The query-expansion model has a 40960-token trained context, so "auto"
+   * reserves ~3.9 GB of KV cache to rewrite a handful of query tokens. Measured on an M-series
+   * 16 GB machine: auto = ~5840 MB RSS, 2048 = ~2118 MB (weights alone are ~1892 MB).
+   */
+  generateContextSize?: number;
+  /**
+   * Context size for the rerank model (default: 4096).
+   *
+   * Same "auto" over-allocation as above. Measured: auto = ~3476 MB RSS, 4096 = ~1265 MB
+   * (weights alone are ~1053 MB). 4096 comfortably covers a query plus an 800-token chunk pair.
+   */
+  rerankContextSize?: number;
 };
 
 /**
@@ -350,6 +366,10 @@ export type LlamaCppConfig = {
  */
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+// Bound the KV cache instead of letting node-llama-cpp's "auto" fill available memory.
+// The generate prompt is ~15 tokens with maxTokens=150; rerank sees a query + one chunk.
+const DEFAULT_GENERATE_CONTEXT_SIZE = 2048;
+const DEFAULT_RERANK_CONTEXT_SIZE = 4096;
 
 export class LlamaCpp implements LLM {
   private llama: Llama | null = null;
@@ -374,6 +394,8 @@ export class LlamaCpp implements LLM {
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
+  private generateContextSize: number;
+  private rerankContextSize: number;
 
   // Track disposal state to prevent double-dispose
   private disposed = false;
@@ -386,6 +408,8 @@ export class LlamaCpp implements LLM {
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+    this.generateContextSize = config.generateContextSize ?? DEFAULT_GENERATE_CONTEXT_SIZE;
+    this.rerankContextSize = config.rerankContextSize ?? DEFAULT_RERANK_CONTEXT_SIZE;
   }
 
   /**
@@ -399,8 +423,13 @@ export class LlamaCpp implements LLM {
       this.inactivityTimer = null;
     }
 
-    // Only set timer if we have disposable contexts and timeout is enabled
-    if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
+    // Only set timer if there is something disposable and timeout is enabled. When models
+    // themselves are disposable, a loaded model with no live context (e.g. after a
+    // generate-only call, whose contexts are per-call) must still arm the timer — otherwise
+    // its weights stay resident forever.
+    const hasDisposableWork = this.hasLoadedContexts() ||
+      (this.disposeModelsOnInactivity && this.hasLoadedModels());
+    if (this.inactivityTimeoutMs > 0 && hasDisposableWork) {
       this.inactivityTimer = setTimeout(() => {
         // Check if session manager allows unloading
         // canUnloadLLM is defined later in this file - it checks the session manager
@@ -424,6 +453,15 @@ export class LlamaCpp implements LLM {
    */
   private hasLoadedContexts(): boolean {
     return !!(this.embedContext || this.rerankContext);
+  }
+
+  /**
+   * Check if any models are currently loaded. Only consulted when disposeModelsOnInactivity
+   * is enabled — model weights are the dominant Metal/VRAM cost, so they count as disposable
+   * work for the inactivity timer even when no context is live.
+   */
+  private hasLoadedModels(): boolean {
+    return !!(this.embedModel || this.generateModel || this.rerankModel);
   }
 
   /**
@@ -629,7 +667,7 @@ export class LlamaCpp implements LLM {
   private async ensureRerankContext(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>> {
     if (!this.rerankContext) {
       const model = await this.ensureRerankModel();
-      this.rerankContext = await model.createRankingContext();
+      this.rerankContext = await model.createRankingContext({ contextSize: this.rerankContextSize });
     }
     this.touchActivity();
     return this.rerankContext;
@@ -737,7 +775,7 @@ export class LlamaCpp implements LLM {
     await this.ensureGenerateModel();
 
     // Create fresh context -> sequence -> session for each call
-    const context = await this.generateModel!.createContext();
+    const context = await this.generateModel!.createContext({ contextSize: this.generateContextSize });
     const sequence = context.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
@@ -810,7 +848,7 @@ export class LlamaCpp implements LLM {
     const prompt = `/no_think Expand this search query: ${query}`;
 
     // Create fresh context for each call
-    const genContext = await this.generateModel!.createContext();
+    const genContext = await this.generateModel!.createContext({ contextSize: this.generateContextSize });
     const sequence = genContext.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
@@ -1178,13 +1216,50 @@ export function canUnloadLLM(): boolean {
 // =============================================================================
 
 let defaultLlamaCpp: LlamaCpp | null = null;
+let defaultLlamaCppConfig: LlamaCppConfig = {};
+
+/**
+ * Configure the default LlamaCpp instance before it is first created. Later calls merge
+ * over earlier ones. Has no effect on an already-created instance (long-lived entrypoints
+ * like the MCP server call this during startup, before any model operation).
+ *
+ * Environment variables win over configured values at creation time:
+ *   QMD_LLM_IDLE_MS         — inactivity timeout in ms (0 disables the timer)
+ *   QMD_LLM_DISPOSE_MODELS  — "1"/"true" to dispose model weights on idle, "0"/"false" to keep
+ *   QMD_LLM_GENERATE_CTX    — context size for the query-expansion model (default 2048)
+ *   QMD_LLM_RERANK_CTX      — context size for the rerank model (default 4096)
+ */
+export function configureDefaultLlamaCpp(config: LlamaCppConfig): void {
+  defaultLlamaCppConfig = { ...defaultLlamaCppConfig, ...config };
+}
+
+function envLlamaCppOverrides(): LlamaCppConfig {
+  const overrides: LlamaCppConfig = {};
+  const idleMs = Bun.env.QMD_LLM_IDLE_MS;
+  if (idleMs !== undefined && idleMs !== "" && Number.isFinite(Number(idleMs))) {
+    overrides.inactivityTimeoutMs = Number(idleMs);
+  }
+  const disposeModels = Bun.env.QMD_LLM_DISPOSE_MODELS;
+  if (disposeModels !== undefined && disposeModels !== "") {
+    overrides.disposeModelsOnInactivity = disposeModels === "1" || disposeModels === "true";
+  }
+  const genCtx = Bun.env.QMD_LLM_GENERATE_CTX;
+  if (genCtx !== undefined && genCtx !== "" && Number.isFinite(Number(genCtx))) {
+    overrides.generateContextSize = Number(genCtx);
+  }
+  const rerankCtx = Bun.env.QMD_LLM_RERANK_CTX;
+  if (rerankCtx !== undefined && rerankCtx !== "" && Number.isFinite(Number(rerankCtx))) {
+    overrides.rerankContextSize = Number(rerankCtx);
+  }
+  return overrides;
+}
 
 /**
  * Get the default LlamaCpp instance (creates one if needed)
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    defaultLlamaCpp = new LlamaCpp({ ...defaultLlamaCppConfig, ...envLlamaCppOverrides() });
   }
   return defaultLlamaCpp;
 }

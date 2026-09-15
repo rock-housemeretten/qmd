@@ -11,6 +11,8 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  setDefaultLlamaCpp,
+  configureDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   withLLMSession,
   canUnloadLLM,
@@ -30,6 +32,60 @@ describe("Default LlamaCpp Singleton", () => {
     const llm2 = getDefaultLlamaCpp();
     expect(llm1).toBe(llm2);
     expect(llm1).toBeInstanceOf(LlamaCpp);
+  });
+});
+
+describe("configureDefaultLlamaCpp", () => {
+  // These run before any integration test loads models, so swapping the default
+  // instance here never orphans loaded weights. Each test restores the prior
+  // instance, stored config, and env so later tests see the original singleton.
+  const resetStoredConfig = () =>
+    configureDefaultLlamaCpp({ disposeModelsOnInactivity: undefined, inactivityTimeoutMs: undefined });
+
+  test("configuration applies to a subsequently created default instance", () => {
+    const saved = getDefaultLlamaCpp();
+    try {
+      setDefaultLlamaCpp(null);
+      configureDefaultLlamaCpp({ disposeModelsOnInactivity: true });
+      const llm = getDefaultLlamaCpp();
+      expect((llm as any).disposeModelsOnInactivity).toBe(true);
+    } finally {
+      resetStoredConfig();
+      setDefaultLlamaCpp(saved);
+    }
+  });
+
+  test("QMD_LLM_DISPOSE_MODELS env var wins over configured value", () => {
+    const saved = getDefaultLlamaCpp();
+    const savedEnv = Bun.env.QMD_LLM_DISPOSE_MODELS;
+    try {
+      setDefaultLlamaCpp(null);
+      configureDefaultLlamaCpp({ disposeModelsOnInactivity: true });
+      Bun.env.QMD_LLM_DISPOSE_MODELS = "0";
+      const llm = getDefaultLlamaCpp();
+      expect((llm as any).disposeModelsOnInactivity).toBe(false);
+    } finally {
+      if (savedEnv === undefined) delete Bun.env.QMD_LLM_DISPOSE_MODELS;
+      else Bun.env.QMD_LLM_DISPOSE_MODELS = savedEnv;
+      resetStoredConfig();
+      setDefaultLlamaCpp(saved);
+    }
+  });
+
+  test("QMD_LLM_IDLE_MS env var sets the inactivity timeout", () => {
+    const saved = getDefaultLlamaCpp();
+    const savedEnv = Bun.env.QMD_LLM_IDLE_MS;
+    try {
+      setDefaultLlamaCpp(null);
+      Bun.env.QMD_LLM_IDLE_MS = "60000";
+      const llm = getDefaultLlamaCpp();
+      expect((llm as any).inactivityTimeoutMs).toBe(60000);
+    } finally {
+      if (savedEnv === undefined) delete Bun.env.QMD_LLM_IDLE_MS;
+      else Bun.env.QMD_LLM_IDLE_MS = savedEnv;
+      resetStoredConfig();
+      setDefaultLlamaCpp(saved);
+    }
   });
 });
 

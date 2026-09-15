@@ -23,7 +23,16 @@ import {
 } from "./store.js";
 import type { Store } from "./store.js";
 import { getCollection, getGlobalContext } from "./collections.js";
-import { disposeDefaultLlamaCpp } from "./llm.js";
+import { configureDefaultLlamaCpp, disposeDefaultLlamaCpp } from "./llm.js";
+
+// MCP servers are long-lived (one per client session, often for days). Unlike one-shot CLI
+// runs, a kept-warm model never gets released by process exit — accumulated servers can
+// exhaust the Metal working set machine-wide (observed: 7 idle stdio servers → GPU OOM for
+// every ggml consumer). So in MCP mode, model weights are disposed on idle too; the next
+// query pays a short reload from disk cache instead. Overridable via QMD_LLM_DISPOSE_MODELS.
+function enableIdleModelReclaim(): void {
+  configureDefaultLlamaCpp({ disposeModelsOnInactivity: true });
+}
 
 // =============================================================================
 // Types for structured content
@@ -530,6 +539,7 @@ function createMcpServer(store: Store): McpServer {
 // =============================================================================
 
 export async function startMcpServer(): Promise<void> {
+  enableIdleModelReclaim();
   const store = createStore();
   const server = createMcpServer(store);
   const transport = new StdioServerTransport();
@@ -551,6 +561,7 @@ export type HttpServerHandle = {
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+  enableIdleModelReclaim();
   const store = createStore();
   const mcpServer = createMcpServer(store);
   const transport = new WebStandardStreamableHTTPServerTransport({
