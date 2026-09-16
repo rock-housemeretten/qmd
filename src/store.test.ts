@@ -29,6 +29,8 @@ import {
   reciprocalRankFusion,
   extractSnippet,
   getChunkEnd,
+  rankPassages,
+  getDocid,
   getCacheKey,
   handelize,
   normalizeVirtualPath,
@@ -2046,6 +2048,102 @@ describe("LlamaCpp Integration", () => {
     // is the whole point of carrying both.
     expect(hit.chunkPos).toBe(hit.chunkSeq === 0 ? 0 : chunkOnePos);
 
+    await cleanupTestDb(store);
+  });
+
+  // ─── Rock #266 Tier 1 — rankPassages ─────────────────────────────────────────
+  // Failures are TYPED, never an empty list: "never embedded" and "no matching passage" are
+  // different facts and a caller that cannot tell them apart reports absence for infrastructure.
+
+  async function twoChunkDoc(hashPrefix: string) {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const hash = hashPrefix;
+    const chunk0 = "First chunk about deployment and servers.\n";
+    const chunk1 = "Second chunk names the Govee H5179 sensor.\n";
+    const body = chunk0 + chunk1;
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc", hash, body, filepath: "/test/doc.md", displayPath: "doc.md",
+    });
+    return { store, collectionName, hash, body, chunk0, chunk1 };
+  }
+
+  test("#266: rankPassages reports not_embedded rather than an empty list", async () => {
+    const { store, collectionName } = await twoChunkDoc("passhash0");
+    store.ensureVecTable(768);   // table exists, but this document has no chunks
+    const res = await rankPassages(store.db, `${collectionName}/doc.md`, "sensor", { limit: 3 });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toBe("not_embedded");
+    await cleanupTestDb(store);
+  });
+
+  test("#266: rankPassages reports not_found for an unknown reference", async () => {
+    const { store } = await twoChunkDoc("passhash1");
+    store.ensureVecTable(768);
+    const res = await rankPassages(store.db, "nope/missing.md", "sensor", { limit: 3 });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toBe("not_found");
+    await cleanupTestDb(store);
+  });
+
+  test("#266: rankPassages resolves qmd:// and #docid to the same document", async () => {
+    const { store, collectionName, hash } = await twoChunkDoc("passhash2");
+    store.ensureVecTable(768);
+    const now = new Date().toISOString();
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, now);
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+      .run(`${hash}_0`, new Float32Array(Array(768).fill(0.1)));
+    // Both references must resolve to the SAME document and rank it identically.
+    const out = [];
+    for (const ref of [`qmd://${collectionName}/doc.md`, `#${getDocid(hash)}`]) {
+      const res = await rankPassages(store.db, ref, "sensor", { limit: 1 });
+      expect(res.ok).toBe(true);
+      if (res.ok) out.push(res.passages[0]!.pos);
+    }
+    expect(out.length).toBe(2);
+    expect(out[0]).toBe(out[1]);
+    await cleanupTestDb(store);
+  });
+
+  test("#266: passage text and lines are cut on content_vectors.pos boundaries", async () => {
+    const { store, collectionName, hash, chunk0, chunk1 } = await twoChunkDoc("passhash3");
+    store.ensureVecTable(768);
+    const now = new Date().toISOString();
+    for (const [seq, pos] of [[0, 0], [1, chunk0.length]] as const) {
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, 'test', ?)`).run(hash, seq, pos, now);
+      // Orthogonal-ish vectors so the ranking is decided by the query, not by ties.
+      const v = Array(768).fill(0); v[seq] = 1;
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_${seq}`, new Float32Array(v));
+    }
+    const res = await rankPassages(store.db, `${collectionName}/doc.md`, "sensor", { limit: 5 });
+    // Assert ok BEFORE narrowing: a bare `if (res.ok)` lets this whole test pass with every
+    // assertion skipped, which is how the Float32Array decode bug survived its own test once.
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.passages.length).toBe(2);
+      const byseq = new Map(res.passages.map(p => [p.seq, p]));
+      // text = body.slice(pos, nextPos) — chunk 0 must stop where chunk 1 begins.
+      expect(byseq.get(0)!.text).toBe(chunk0);
+      expect(byseq.get(1)!.text).toBe(chunk1);
+      expect(byseq.get(0)!.startLine).toBe(1);   // 1-indexed from the document body
+      expect(byseq.get(1)!.startLine).toBe(2);
+      expect(byseq.get(1)!.pos).toBe(chunk0.length);
+    }
+    await cleanupTestDb(store);
+  });
+
+  test("#266: rankPassages honours the -n bound", async () => {
+    const { store, collectionName, hash, chunk0 } = await twoChunkDoc("passhash4");
+    store.ensureVecTable(768);
+    const now = new Date().toISOString();
+    for (const [seq, pos] of [[0, 0], [1, chunk0.length]] as const) {
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, 'test', ?)`).run(hash, seq, pos, now);
+      const v = Array(768).fill(0); v[seq] = 1;
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_${seq}`, new Float32Array(v));
+    }
+    const res = await rankPassages(store.db, `${collectionName}/doc.md`, "sensor", { limit: 1 });
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.passages.length).toBe(1);
     await cleanupTestDb(store);
   });
 

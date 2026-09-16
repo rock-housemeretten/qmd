@@ -26,6 +26,7 @@ qmd embed
 # Search across everything
 qmd search "project timeline"           # Fast keyword search
 qmd vsearch "how to deploy"             # Semantic search
+qmd passages <file> "sensor"            # Rank one document's chunks (Rock #266)
 qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
 
 # Get a specific document
