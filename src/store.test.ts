@@ -28,6 +28,7 @@ import {
   chunkDocumentByTokens,
   reciprocalRankFusion,
   extractSnippet,
+  getChunkEnd,
   getCacheKey,
   handelize,
   normalizeVirtualPath,
@@ -1409,6 +1410,67 @@ describe("Document Retrieval", () => {
 // =============================================================================
 
 describe("Snippet Extraction", () => {
+  // ─── Rock #266 Tier 0 ────────────────────────────────────────────────────────
+  // Three defects made the snippet land on the document HEAD instead of the matched chunk.
+  // Each test below fails against the pre-patch implementation.
+
+  test("#266 defect 1: chunk 0 is a real hint, not 'no hint'", () => {
+    // Pre-patch guard was `chunkPos && chunkPos > 0`, so a hit in the FIRST chunk (pos 0) fell
+    // through to whole-document scoring. Here the decoy late in the doc would win that way.
+    // The decoy must OUT-SCORE chunk 0 when the window is ignored, or the test passes pre-patch
+    // by tie-break alone: two distinct query terms on the decoy line, one on chunk 0's.
+    const chunk0 = "Alpha mentions the sensor here.\nmore chunk zero text\n";
+    const rest = "filler\n".repeat(50) + "decoy temperature sensor line\n";
+    const body = chunk0 + rest;
+    const { line } = extractSnippet(body, "temperature sensor", 500, 0, chunk0.length);
+    expect(line).toBe(1); // inside chunk 0, not the higher-scoring decoy outside it
+  });
+
+  test("#266 defect 2: the window is the WHOLE chunk, not ~700 chars of it", () => {
+    // Pre-patch window was [chunkPos-100, chunkPos+maxLen+100]. With a 2,400-char chunk, an
+    // answer 1,500 chars in was outside what the scorer could see.
+    const head = "chunk head restating the title\n";
+    const filler = "padding line without the term\n".repeat(50); // ~1,500 chars
+    const answer = "the Govee H5179 is the unit\n";
+    const chunk = head + filler + answer + "tail\n";
+    const body = "PRECEDING CHUNK\n" + chunk;
+    const pos = body.indexOf(head);
+    const { snippet } = extractSnippet(body, "govee", 500, pos, body.length);
+    expect(snippet).toContain("Govee H5179");
+  });
+
+  test("#266 defect 3: sub-3-char tokens do not score, so the head stops winning", () => {
+    // Pre-patch used `includes` over EVERY whitespace token, so `a` and `is` matched almost any
+    // line and the title-restating head line won every query. The filter is `length >= 3`, so
+    // `for` and `what` still count deliberately — they are harmless on a whole-word match; it is
+    // the one- and two-character tokens that made every line look equally relevant.
+    const body = [
+      "a is a is a is an it to of",           // pre-patch: scores 2 on `a`/`is` and wins
+      "unrelated",
+      "the thermometer model listed here",    // post-patch: the only line with a scoring term
+    ].join("\n");
+    const { line } = extractSnippet(body, "a is thermometer", 500);
+    expect(line).toBe(3);
+  });
+
+  test("#266 defect 3: whole-word, so a substring does not score", () => {
+    const body = "sensory overload discussion\nthe sensor itself";
+    const { line } = extractSnippet(body, "sensor", 500);
+    expect(line).toBe(2); // "sensory" must not match "sensor"
+  });
+
+  test("#266: the full-document fallback still fires on an empty chunk window", () => {
+    const body = "real content with keyword here\n" + "\n\n\n";
+    const { snippet } = extractSnippet(body, "keyword", 500, body.length - 3, body.length);
+    expect(snippet).toContain("keyword");
+  });
+
+  test("#266: punctuation in the question does not weld terms together", () => {
+    const body = "nothing here\nthe lime tree sensor reading";
+    const { line } = extractSnippet(body, "What sensor, for a lime tree?", 500);
+    expect(line).toBe(2);
+  });
+
   test("extractSnippet finds query terms", () => {
     const body = "First line.\nSecond line with keyword.\nThird line.\nFourth line.";
     const { line, snippet } = extractSnippet(body, "keyword", 500);
@@ -1951,6 +2013,56 @@ describe("LlamaCpp Integration", () => {
     expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
     expect(results[0]!.source).toBe("vec");
+
+    await cleanupTestDb(store);
+  });
+
+  // ─── Rock #266 Tier 0 ────────────────────────────────────────────────────────
+  test("#266: searchVec carries the matched chunk's pos AND seq", async () => {
+    // These were the inputs the vsearch CLI never received: searchVec had chunkPos, never emitted
+    // chunkSeq, and vectorSearchQuery dropped both when merging per file.
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const hash = "chunkhash1";
+    const body = "HEAD chunk zero text\n" + "x".repeat(40) + "\nTAIL chunk one text\n";
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1", hash, body, filepath: "/test/doc1.md", displayPath: "doc1.md",
+    });
+    store.ensureVecTable(768);
+    const now = new Date().toISOString();
+    const chunkOnePos = body.indexOf("TAIL");
+    for (const [seq, pos] of [[0, 0], [1, chunkOnePos]] as const) {
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, 'test', ?)`).run(hash, seq, pos, now);
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+        .run(`${hash}_${seq}`, new Float32Array(Array(768).fill(0).map(() => Math.random())));
+    }
+
+    const results = await store.searchVec("test query", "embeddinggemma", 10);
+    expect(results).toHaveLength(1);           // one row per FILE, best chunk only
+    const hit = results[0]!;
+    expect(hit.chunkPos).toBeDefined();
+    expect(hit.chunkSeq).toBeDefined();
+    // The pos reported must be the pos of the seq reported — the pair has to be coherent, which
+    // is the whole point of carrying both.
+    expect(hit.chunkPos).toBe(hit.chunkSeq === 0 ? 0 : chunkOnePos);
+
+    await cleanupTestDb(store);
+  });
+
+  test("#266: getChunkEnd returns the next chunk's pos, and undefined on the last", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const hash = "chunkhash2";
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc2", hash, body: "a".repeat(200), filepath: "/test/doc2.md", displayPath: "doc2.md",
+    });
+    const now = new Date().toISOString();
+    for (const [seq, pos] of [[0, 0], [1, 120]] as const) {
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, 'test', ?)`).run(hash, seq, pos, now);
+    }
+    const path = `qmd://${collectionName}/doc2.md`;
+    expect(getChunkEnd(store.db, path, 0)).toBe(120);   // chunk 0 ends where chunk 1 starts
+    expect(getChunkEnd(store.db, path, 1)).toBeUndefined(); // last chunk → caller uses body length
 
     await cleanupTestDb(store);
   });
