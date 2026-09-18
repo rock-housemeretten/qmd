@@ -1520,6 +1520,53 @@ export function getContextForPath(db: Database, collectionName: string, path: st
  * Separate from searchVec's hot path on purpose: it is one indexed lookup, run only for the
  * handful of results a CLI actually renders.
  */
+// ─── Rock #340 lever 2 — the CLI's `--json` row shape, as a pure function ─────────────────────
+//
+// `qmd vsearch --json` / `qmd search --json` are what Rock Neo's gateway parses (parseVsearch).
+// The resident MCP server's own `vector_search` / `search` tools return a DIFFERENT shape
+// (displayPath without qmd://, snippet with line numbers baked in, and — critically — no
+// chunkPos/chunkSeq, i.e. the whole-document snippet the #266 Tier 0 fix removed from the CLI).
+// Routing the gateway through those tools would have regressed #266. So the CLI's row builder
+// lives here, once, and both the CLI (outputResults) and the `rock_vsearch` / `rock_search` MCP
+// tools render through it — the gateway sees one shape whether it spawned a process or not.
+export interface JsonRowInput {
+  file: string; displayPath: string; title: string; body: string; score: number;
+  context?: string | null; chunkPos?: number; chunkSeq?: number; chunkEnd?: number; hash?: string; docid?: string;
+}
+export interface JsonRow {
+  docid?: string; score: number; file: string; title: string; context?: string;
+  body?: string; snippet?: string; chunkPos?: number; chunkSeq?: number;
+}
+export function toJsonRows(
+  results: JsonRowInput[], query: string,
+  opts: { minScore: number; limit: number; full?: boolean; lineNumbers?: boolean },
+): JsonRow[] {
+  const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
+  return filtered.map(row => {
+    const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
+    let body = opts.full ? row.body : undefined;
+    let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, row.chunkEnd).snippet : undefined;
+    if (opts.lineNumbers) {
+      if (body) body = addLineNumbers(body);
+      if (snippet) snippet = addLineNumbers(snippet);
+    }
+    return {
+      ...(docid && { docid: `#${docid}` }),
+      score: Math.round(row.score * 100) / 100,
+      file: `qmd://${row.displayPath}`,
+      title: row.title,
+      ...(row.context && { context: row.context }),
+      ...(body && { body }),
+      ...(snippet && { snippet }),
+      // Rock #266 Tier 0 — ADDITIVE. The `@@ -L,n @@` header inside `snippet` is unchanged, so
+      // the gateway's parseVsearch keeps working; these let a consumer tell WHICH chunk the
+      // snippet came from, which is what the gateway's refinement step needs to detect no_gain.
+      ...(row.chunkPos !== undefined && { chunkPos: row.chunkPos }),
+      ...(row.chunkSeq !== undefined && { chunkSeq: row.chunkSeq }),
+    };
+  });
+}
+
 export function getChunkEnd(db: Database, filepath: string, chunkSeq: number): number | undefined {
   // Same join searchVec uses: documents(active=1) is what maps a qmd:// path to a content hash.
   const row = db.prepare(`

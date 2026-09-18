@@ -2835,3 +2835,22 @@ describe("isDocid", () => {
     expect(isDocid("abc123.md")).toBe(false);
   });
 });
+
+// ── Rock #340 — toJsonRows is the ONE row builder the CLI's --json and the resident MCP tools share ──
+describe("Rock #340: toJsonRows", () => {
+  test("renders the CLI --json row shape: qmd:// file, chunk-aware snippet, chunkPos/chunkSeq, rounded score", () => {
+    const { toJsonRows } = require("./store.ts") as typeof import("./store.ts");
+    const body = "intro line\n\nA long paragraph about thermometers and lime trees that the chunk should cover.\n\nunrelated tail";
+    const rows = toJsonRows([
+      { file: "qmd://c/a.md", displayPath: "c/a.md", title: "A", body, score: 0.6543, docid: "abc123", chunkPos: 12, chunkSeq: 1, chunkEnd: 90 },
+      { file: "qmd://c/b.md", displayPath: "c/b.md", title: "B", body: "short", score: 0.2, hash: "deadbeefcafe" },
+      { file: "qmd://c/c.md", displayPath: "c/c.md", title: "C", body: "x", score: 0.9, hash: "0123456789ab" },
+    ], "lime thermometer", { minScore: 0.3, limit: 10 });
+    expect(rows.map(r => r.file)).toEqual(["qmd://c/a.md", "qmd://c/c.md"]);   // 0.2 filtered by minScore
+    expect(rows[0]).toMatchObject({ docid: "#abc123", score: 0.65, title: "A", chunkPos: 12, chunkSeq: 1 });
+    expect(rows[0].snippet).toContain("thermometers");            // the CHUNK, not the intro line
+    expect(rows[1]).toMatchObject({ docid: "#012345", score: 0.9 });
+    expect("chunkSeq" in rows[1]).toBe(false);                     // absent, not undefined
+    expect(toJsonRows([{ file: "f", displayPath: "d", title: "t", body: "b", score: 1 }], "q", { minScore: 0, limit: 1, full: true })[0].body).toBe("b");
+  });
+});

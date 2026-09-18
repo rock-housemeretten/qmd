@@ -20,6 +20,10 @@ import {
   hybridQuery,
   vectorSearchQuery,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  toJsonRows,
+  getChunkEnd,
+  searchFTS,
+  getContextForFile,
 } from "./store.js";
 import type { Store } from "./store.js";
 import { getCollection, getGlobalContext } from "./collections.js";
@@ -321,6 +325,69 @@ function createMcpServer(store: Store): McpServer {
   );
 
   // ---------------------------------------------------------------------------
+  // Rock #340 lever 2 — `rock_vsearch` / `rock_search`: the CLI's --json rows, resident.
+  //
+  // Rock Neo's gateway spawned `qmd vsearch … --json` per retrieve and paid process start +
+  // embedder load (~2.3 s) + a cold llm_cache every call. These two tools return EXACTLY the
+  // rows the CLI prints (toJsonRows — one builder, shared), so the gateway's parser is unchanged
+  // and #266's chunk-aware snippet survives. structuredContent.rows is the contract; the text
+  // content is a one-line summary for a human reading the MCP by hand.
+  // ---------------------------------------------------------------------------
+  server.registerTool(
+    "rock_vsearch",
+    {
+      title: "Rock: vector search (CLI --json rows)",
+      description: "Vector search returning the same JSON rows as `qmd vsearch --json` (qmd:// file, chunk-aware snippet, chunkPos/chunkSeq). For Rock Neo's gateway; prefer vector_search for interactive use.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        query: z.string(),
+        limit: z.number().optional().default(10),
+        minScore: z.number().optional().default(0.3),
+        collection: z.string().optional(),
+      },
+    },
+    async ({ query, limit, minScore, collection }) => {
+      const results = await vectorSearchQuery(store, query, { collection, limit, minScore });
+      const rows = toJsonRows(results.map(r => ({
+        file: r.file, displayPath: r.displayPath, title: r.title, body: r.body, score: r.score,
+        context: r.context, docid: r.docid, chunkPos: r.chunkPos, chunkSeq: r.chunkSeq,
+        chunkEnd: r.chunkSeq !== undefined ? getChunkEnd(store.db, r.file, r.chunkSeq) : undefined,
+      })), query, { minScore, limit });
+      return {
+        content: [{ type: "text", text: `${rows.length} row(s) for "${query}"` }],
+        structuredContent: { rows },
+      };
+    }
+  );
+
+  server.registerTool(
+    "rock_search",
+    {
+      title: "Rock: BM25 search (CLI --json rows)",
+      description: "Full-text (BM25) search returning the same JSON rows as `qmd search --json`. For Rock Neo's gateway.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        query: z.string(),
+        limit: z.number().optional().default(10),
+        collection: z.string().optional(),
+      },
+    },
+    async ({ query, limit, collection }) => {
+      // Mirrors the CLI's `search`: fetch more than needed, let the row builder filter/slice.
+      const fetchLimit = Math.max(50, limit * 2);
+      const results = searchFTS(store.db, query, fetchLimit, collection as any);
+      const rows = toJsonRows(results.map(r => ({
+        file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score,
+        context: getContextForFile(store.db, r.filepath), hash: r.hash, docid: r.docid,
+      })), query, { minScore: 0, limit });
+      return {
+        content: [{ type: "text", text: `${rows.length} row(s) for "${query}"` }],
+        structuredContent: { rows },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Tool: qmd_deep_search (Deep search with expansion + reranking)
   // ---------------------------------------------------------------------------
 
@@ -564,7 +631,13 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   enableIdleModelReclaim();
   const store = createStore();
   const mcpServer = createMcpServer(store);
+  // Rock #340 lever 2 — STATEFUL transport. Without a sessionIdGenerator the SDK transport is
+  // stateless and refuses to be reused: the SECOND request to `qmd mcp --http` ever made returned
+  // "Stateless transport cannot be reused across requests" (500). One transport per server is the
+  // design here (a single resident process, one Store), so a session id makes it legal — and is
+  // what lets the gateway hold a long-lived MCP session against it.
   const transport = new WebStandardStreamableHTTPServerTransport({
+    sessionIdGenerator: () => crypto.randomUUID(),
     enableJsonResponse: true,
   });
   await mcpServer.connect(transport);

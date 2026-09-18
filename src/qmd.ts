@@ -66,6 +66,7 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
+  toJsonRows,
 } from "./store.js";
 import { disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
 import {
@@ -1749,30 +1750,9 @@ function outputResults(results: { file: string; displayPath: string; title: stri
   const toQmdPath = (displayPath: string) => `qmd://${displayPath}`;
 
   if (opts.format === "json") {
-    // JSON output for LLM consumption
-    const output = filtered.map(row => {
-      const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, row.chunkEnd).snippet : undefined;
-      if (opts.lineNumbers) {
-        if (body) body = addLineNumbers(body);
-        if (snippet) snippet = addLineNumbers(snippet);
-      }
-      return {
-        ...(docid && { docid: `#${docid}` }),
-        score: Math.round(row.score * 100) / 100,
-        file: toQmdPath(row.displayPath),
-        title: row.title,
-        ...(row.context && { context: row.context }),
-        ...(body && { body }),
-        ...(snippet && { snippet }),
-        // Rock #266 Tier 0 — ADDITIVE. The `@@ -L,n @@` header inside `snippet` is unchanged, so
-        // the gateway's parseVsearch keeps working; these let a consumer tell WHICH chunk the
-        // snippet came from, which is what the gateway's refinement step needs to detect no_gain.
-        ...(row.chunkPos !== undefined && { chunkPos: row.chunkPos }),
-        ...(row.chunkSeq !== undefined && { chunkSeq: row.chunkSeq }),
-      };
-    });
+    // JSON output for LLM consumption — Rock #340: through the shared row builder, so the resident
+    // MCP tools (rock_vsearch / rock_search) and this CLI path cannot drift apart.
+    const output = toJsonRows(results, query, opts);
     console.log(JSON.stringify(output, null, 2));
   } else if (opts.format === "files") {
     // Simple docid,score,filepath,context output
