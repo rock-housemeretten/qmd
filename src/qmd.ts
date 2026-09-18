@@ -29,7 +29,6 @@ import {
   extractTitle,
   formatDocForEmbedding,
   chunkDocumentByTokens,
-  clearCache,
   getCacheKey,
   getCachedResult,
   setCachedResult,
@@ -372,8 +371,12 @@ async function updateCollections(): Promise<void> {
   const db = getDb();
   // Collections are defined in YAML; no duplicate cleanup needed.
 
-  // Clear Ollama cache on update
-  clearCache(db);
+  // ROCK #339: do NOT clear llm_cache here. The cache holds query EXPANSIONS (HyDE/vec variants)
+  // keyed on {query, model}; nothing in that key depends on index contents, so a re-index does not
+  // invalidate it. Wiping it on every `update` (heartbeat, every 30 min) made vsearch regenerate
+  // variants at temperature 0.7 each time and re-roll the ranking twice an hour. Only an
+  // expansion-model change invalidates an entry, and `model` is already in the key. The explicit
+  // `qmd cleanup` still empties it; the 1,000-row LRU trim in setCachedResult still bounds it.
 
   const collections = listCollections(db);
 
@@ -1356,8 +1359,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const now = new Date().toISOString();
   const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
-  // Clear Ollama cache on index
-  clearCache(db);
+  // ROCK #339: no llm_cache wipe on index either — see updateCollections.
 
   // Collection name must be provided (from YAML)
   if (!collectionName) {

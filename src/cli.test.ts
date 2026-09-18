@@ -368,6 +368,39 @@ describe("CLI Update Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Updating");
   });
+
+  // ROCK #339: `update` (heartbeat, every 30 min) and `index` used to `DELETE FROM llm_cache`, so
+  // query expansions regenerated at temperature 0.7 after every run and vsearch re-rolled its
+  // ranking twice an hour. The cache is keyed on {query, model} — index contents are not in the key.
+  test("ROCK #339: update and collection-add (index) leave llm_cache intact; cleanup still empties it", async () => {
+    const { Database } = await import("bun:sqlite");
+    const seed = () => {
+      const db = new Database(localDbPath);
+      db.prepare(`INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?, ?, ?)`)
+        .run("expansion:test-query", "cached variants", new Date().toISOString());
+      const n = (db.prepare(`SELECT COUNT(*) AS n FROM llm_cache`).get() as { n: number }).n;
+      db.close();
+      return n;
+    };
+    const count = () => {
+      // NOT readonly: a readonly handle can see a stale pre-VACUUM WAL snapshot after `cleanup`.
+      const db = new Database(localDbPath);
+      const n = (db.prepare(`SELECT COUNT(*) AS n FROM llm_cache`).get() as { n: number }).n;
+      db.close();
+      return n;
+    };
+    expect(seed()).toBe(1);
+    expect((await runQmd(["update"], { dbPath: localDbPath })).exitCode).toBe(0);
+    expect(count()).toBe(1);                                   // survived update
+    // `collection add` is the other indexFiles() caller (the old "clear on index" site)
+    // (a second path — beforeEach already registered "." and a duplicate path is refused)
+    expect((await runQmd(["collection", "add", join(fixturesDir, "notes"), "--name", "fixtures-339"], { dbPath: localDbPath })).exitCode).toBe(0);
+    expect(count()).toBe(1);                                   // survived index
+    const cl = await runQmd(["cleanup"], { dbPath: localDbPath });
+    expect(cl.exitCode).toBe(0);
+    expect(cl.stdout).toContain("Cleared 1 cached");
+    expect(count()).toBe(0);                                   // the explicit, operator-invoked wipe still works
+  });
 });
 
 describe("CLI Add-Context Command", () => {
