@@ -2000,13 +2000,50 @@ export interface Passage {
   pos: number;
   startLine: number;   // 1-indexed, from the document body
   endLine: number;     // 1-indexed, inclusive
-  score: number;       // cosine similarity, 1 = identical
+  score: number;       // fused RRF score (Rock #340); `vecScore` keeps the cosine for the record
+  vecScore?: number;   // cosine similarity, 1 = identical
+  lexScore?: number;   // within-document BM25 over the chunks
+  rankedBy?: ('vec' | 'lex')[];   // which leg(s) placed this chunk in their top-K
   text: string;
 }
 
 export type RankPassagesResult =
   | { ok: true; passages: Passage[] }
   | { ok: false; error: 'not_found' | 'not_embedded' | 'no_vectors_table' | 'embed_failed' };
+
+// ─── Rock #340 — the lexical leg for rankPassages ────────────────────────────────────────────
+//
+// Within ONE document the chunks are ~16 short texts, so a BM25 over them is microseconds and
+// needs no FTS table. Measured on the lime note (Rock-neo #340, Fable): the answer chunk ("Total
+// investment: $67-77", chunk 9 of 16) ranks 11th/4th/15th by embedding but FIRST by BM25 — it is
+// the chunk that carries the question's words in prose. Fused with RRF, the same shape the
+// document-level search already uses (#271).
+const PASSAGE_TOKEN_RE = /[a-z0-9][a-z0-9'-]*/g;
+function tokensOf(s: string): string[] {
+  return (s.toLowerCase().match(PASSAGE_TOKEN_RE) ?? []).filter(t => t.length >= 2);
+}
+/** BM25 (k1 1.2, b 0.75) of `query` against each chunk text, in chunk order. */
+export function bm25OverChunks(query: string, chunkTexts: string[]): number[] {
+  const q = [...new Set(tokensOf(query))];
+  const docs = chunkTexts.map(tokensOf);
+  const N = docs.length;
+  const avgdl = docs.reduce((a, d) => a + d.length, 0) / Math.max(1, N);
+  const df = new Map<string, number>();
+  for (const d of docs) for (const t of new Set(d)) df.set(t, (df.get(t) ?? 0) + 1);
+  const k1 = 1.2, b = 0.75;
+  return docs.map(d => {
+    const tf = new Map<string, number>();
+    for (const t of d) tf.set(t, (tf.get(t) ?? 0) + 1);
+    let score = 0;
+    for (const t of q) {
+      const f = tf.get(t); if (!f) continue;
+      const n = df.get(t) ?? 0;
+      const idf = Math.log(1 + (N - n + 0.5) / (n + 0.5));
+      score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * d.length / Math.max(1, avgdl)));
+    }
+    return score;
+  });
+}
 
 /**
  * Rank ONE document's already-stored chunk embeddings against a query.
@@ -2097,8 +2134,39 @@ export async function rankPassages(
   }
   if (scored.length === 0) return { ok: false, error: 'not_embedded' };
 
-  scored.sort((a, b) => b.score - a.score);
-  return { ok: true, passages: scored.slice(0, limit) };
+  // Rock #340 — fuse the vector ranking with a within-document BM25 ranking, and say which leg(s)
+  // ranked each returned chunk. `score` becomes the fused score; the cosine is kept as `vecScore`.
+  //
+  // NOT plain RRF. Measured on the lime note (16 chunks): the answer chunk is BM25 rank 0 with a
+  // clear margin (4.45 vs 3.18) but vector rank ~11, and under k=60 RRF a chunk that is mid-pack
+  // on BOTH legs (rank 3 + rank 4 = 0.0315) beats rank 0 on one leg alone (0.0164) — the exact
+  // failure a within-document reranker exists to fix. So K is small (the lists are ~16 long and
+  // the legs are not equally trustworthy here), and a lexical rank-0 with a real margin over
+  // rank-1 gets that margin as a bonus: the question's own words in prose are strong evidence at
+  // this scale, where the embedding is comparing one document's paragraphs against itself.
+  const K = 8;
+  const lex = bm25OverChunks(query, scored.map(p => p.text));
+  const byVec = [...scored].sort((a, b) => b.score - a.score);
+  const byLex = scored.map((p, i) => ({ p, s: lex[i]! })).filter(x => x.s > 0).sort((a, b) => b.s - a.s).map(x => x.p);
+  const fused = new Map<number, Passage>();
+  const add = (p: Passage, rank: number, leg: 'vec' | 'lex', legScore: number) => {
+    const cur = fused.get(p.seq) ?? { ...p, vecScore: p.score, score: 0, rankedBy: [] as ('vec' | 'lex')[] };
+    cur.score += 1 / (K + rank + 1);
+    if (leg === 'lex') cur.lexScore = legScore;
+    if (rank < limit) cur.rankedBy!.push(leg);
+    fused.set(p.seq, cur);
+  };
+  byVec.forEach((p, i) => add(p, i, 'vec', p.score));
+  byLex.forEach((p, i) => add(p, i, 'lex', lex[scored.indexOf(p)]!));
+  if (byLex.length >= 2) {
+    // Lexical margin bonus: (top − second) / top, in units of one rank-0 RRF slot.
+    const l0 = lex[scored.indexOf(byLex[0]!)]!, l1 = lex[scored.indexOf(byLex[1]!)]!;
+    const margin = l0 > 0 ? (l0 - l1) / l0 : 0;
+    const top = fused.get(byLex[0]!.seq);
+    if (top) top.score += margin * (1 / (K + 1));
+  }
+  const out = [...fused.values()].sort((a, b) => b.score - a.score || (b.vecScore ?? 0) - (a.vecScore ?? 0));
+  return { ok: true, passages: out.slice(0, limit) };
 }
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {

@@ -30,6 +30,7 @@ import {
   extractSnippet,
   getChunkEnd,
   rankPassages,
+  bm25OverChunks,
   getDocid,
   getCacheKey,
   handelize,
@@ -2128,6 +2129,42 @@ describe("LlamaCpp Integration", () => {
       expect(byseq.get(0)!.startLine).toBe(1);   // 1-indexed from the document body
       expect(byseq.get(1)!.startLine).toBe(2);
       expect(byseq.get(1)!.pos).toBe(chunk0.length);
+    }
+    await cleanupTestDb(store);
+  });
+
+  // ─── Rock #340 — the lexical leg ───────────────────────────────────────────────
+  test("#340: bm25OverChunks ranks the chunk that carries the question's words, in prose", () => {
+    const chunks = [
+      "Wind matters as much as cold. Position the tree on the south or east side of structures.",
+      "Budget System Under $75: Combine a Govee H5179 sensor ($20) with smart plugs for a protection system that costs little. Total investment: $67-77.",
+      "Overwintering a potted lime tree in Northern Virginia takes planning.",
+    ];
+    const s = bm25OverChunks("what does the budget tree protection system cost", chunks);
+    expect(s[1]).toBeGreaterThan(s[0]);
+    expect(s[1]).toBeGreaterThan(s[2]);
+    expect(bm25OverChunks("zzzz", chunks)).toEqual([0, 0, 0]);   // no shared token → zero, never NaN
+  });
+
+  test("#340: rankPassages fuses the vector leg with a within-document BM25 leg and says which leg ranked each chunk", async () => {
+    const { store, collectionName, hash, chunk0 } = await twoChunkDoc("passhash5");
+    store.ensureVecTable(768);
+    const now = new Date().toISOString();
+    for (const [seq, pos] of [[0, 0], [1, chunk0.length]] as const) {
+      store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, 'test', ?)`).run(hash, seq, pos, now);
+      const v = Array(768).fill(0); v[seq] = 1;
+      store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_${seq}`, new Float32Array(v));
+    }
+    // "Govee H5179 sensor" is in chunk 1 only → BM25 puts chunk 1 first regardless of the (one-hot,
+    // query-agnostic) vectors; the fused order must reflect that and record the lex leg.
+    const res = await rankPassages(store.db, `${collectionName}/doc.md`, "Govee H5179 sensor", { limit: 2 });
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.passages[0]!.seq).toBe(1);
+      expect(res.passages[0]!.rankedBy).toContain("lex");
+      expect(res.passages[0]!.lexScore).toBeGreaterThan(0);
+      expect(typeof res.passages[0]!.vecScore).toBe("number");     // the cosine survives
+      expect(res.passages[0]!.score).toBeGreaterThan(res.passages[1]!.score);   // fused RRF, descending
     }
     await cleanupTestDb(store);
   });
